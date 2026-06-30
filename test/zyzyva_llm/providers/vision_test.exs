@@ -33,6 +33,19 @@ defmodule ZyzyvaLlm.Providers.VisionTest do
     end
   end
 
+  defmodule UsageStub do
+    def post(_url, _opts) do
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "choices" => [%{"message" => %{"content" => "text out"}}],
+           "usage" => %{"prompt_tokens" => 3, "completion_tokens" => 4, "total_tokens" => 7}
+         }
+       }}
+    end
+  end
+
   # base64 of "hello"
   @image %{data: "aGVsbG8=", mime_type: "image/png"}
 
@@ -166,6 +179,36 @@ defmodule ZyzyvaLlm.Providers.VisionTest do
       Vision.call(:groq, "p", @image, api_key: "k", http_client: CaptureStub)
       assert_received {:request, _url, opts}
       assert JSON.decode!(opts[:body])["model"] == "qwen/qwen3.6-27b"
+    end
+  end
+
+  describe "call_with_usage/4 (internal usage variant)" do
+    test "returns text plus the resolved model id and the usage map" do
+      assert {:ok, "text out", %{model: "gemini-3.1-flash-lite", usage: usage}} =
+               Vision.call_with_usage(:gemini, "p", @image,
+                 api_key: "k",
+                 model: :vision,
+                 http_client: UsageStub
+               )
+
+      assert usage == %{"prompt_tokens" => 3, "completion_tokens" => 4, "total_tokens" => 7}
+    end
+
+    test "usage is nil when the response carries none" do
+      assert {:ok, "extracted", %{model: "explicit-x", usage: nil}} =
+               Vision.call_with_usage(:groq, "p", @image,
+                 api_key: "k",
+                 model: "explicit-x",
+                 http_client: SuccessStub
+               )
+    end
+
+    test "surfaces the same error shapes as call/4" do
+      assert {:error, {:api_error, 429, _}} =
+               Vision.call_with_usage(:groq, "p", @image,
+                 api_key: "k",
+                 http_client: RateLimitStub
+               )
     end
   end
 

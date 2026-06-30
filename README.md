@@ -63,6 +63,52 @@ ZyzyvaLlm.vision(:groq, prompt, image,
 )
 ```
 
+### Vision failover chain
+
+`vision_chain/4` runs an ordered list of stages over `vision/4` so consuming apps
+share one resilience walk instead of re-implementing it. Each stage is a list of
+entries whose order is the acceptance hierarchy (earliest preferred); within a
+stage every entry fires concurrently, each bounded by its own `:timeout`. The
+caller supplies a `:validator` that decides whether a leg's raw text is usable and
+what the parsed value is — the library never parses domain data.
+
+```elixir
+stages = [
+  # stage 1: primary Gemini alone
+  [%{provider: :gemini, model: :vision, timeout: 30_000}],
+  # stage 2 (only if stage 1 yields nothing usable): secondary Gemini and the
+  # Groq Qwen fallback, raced together, accepted by hierarchy (cross-vendor)
+  [
+    %{provider: :gemini, model: :vision_secondary, timeout: 30_000},
+    %{provider: :groq, model: :vision_fallback, reasoning_effort: "none",
+      max_tokens: 8192, timeout: 30_000}
+  ]
+]
+
+ZyzyvaLlm.vision_chain(stages, prompt, image,
+  validator: fn text -> MyApp.parse(text) end,
+  api_key: key
+)
+#=> {:ok, parsed, %{provider: :gemini, model: "gemini-3.1-flash-lite", stage: 1, usage: %{...}}}
+```
+
+Returns:
+
+- `{:ok, parsed, %{provider:, model:, stage:, usage:}}` — the validator's parsed
+  value plus which provider/model won, the 1-based stage, and the winning
+  response's token `usage` (or `nil`).
+- `{:error, :exhausted}` — every leg in every stage failed transiently or was
+  judged unusable.
+- the underlying client error as-is (e.g. `{:error, {:api_error, 400, body}}`) when
+  a leg hits a permanent 4xx (except 429) — the chain short-circuits, since no
+  provider will do better.
+
+Transient failures (429, any 5xx, transport errors, a missing key on one provider)
+and validator-rejected 200s advance to the next leg/stage; a bounded in-leg retry
+(`:max_retries`, default 1) covers transient provider blips. Image downscaling is
+not handled here (a too-large image surfaces as the provider's own client error);
+it is deferred pending a dependency decision.
+
 ## Providers
 
 `:anthropic`, `:gemini`, `:grok`, `:groq`, `:openai`, `:perplexity`.
@@ -106,6 +152,7 @@ ZyzyvaLlm.chat(:groq, messages, api_key: "k", http_client: SuccessStub)
 
 ## Scope
 
-Text chat completions (`chat/3`) and single-call vision input (`vision/4`). The
-library returns raw provider text and uniform errors; prompts and parsing stay in
-the consuming apps. The staged-race vision failover chain is the next slice.
+Text chat completions (`chat/3`), single-call vision input (`vision/4`), and the
+staged-race vision failover chain (`vision_chain/4`). The library returns raw
+provider text and uniform errors; prompts and parsing stay in the consuming apps.
+Image downscaling for the chain is deferred pending a dependency decision.

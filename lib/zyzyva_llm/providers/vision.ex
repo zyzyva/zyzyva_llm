@@ -29,9 +29,24 @@ defmodule ZyzyvaLlm.Providers.Vision do
   @spec call(:gemini | :groq, String.t(), image(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def call(provider, prompt, image, opts \\ []) do
+    case call_with_usage(provider, prompt, image, opts) do
+      {:ok, text, _info} -> {:ok, text}
+      error -> error
+    end
+  end
+
+  @doc false
+  # Internal variant used by the vision chain: on success it returns the text
+  # together with the resolved model id and the response `usage` map (or `nil`),
+  # so the chain can surface which model won and its token usage. The public
+  # `call/4` / `ZyzyvaLlm.vision/4` contract stays `{:ok, text}`.
+  @spec call_with_usage(:gemini | :groq, String.t(), image(), keyword()) ::
+          {:ok, String.t(), %{model: String.t(), usage: map() | nil}} | {:error, term()}
+  def call_with_usage(provider, prompt, image, opts \\ []) do
     max_tokens = opts[:max_tokens] || 4096
     timeout = opts[:timeout] || 120_000
     http = opts[:http_client] || Req
+    model = resolve_model(opts[:model], provider)
 
     case ApiKey.resolve(provider, opts) do
       nil ->
@@ -40,7 +55,7 @@ defmodule ZyzyvaLlm.Providers.Vision do
       key ->
         body =
           %{
-            model: resolve_model(opts[:model], provider),
+            model: model,
             max_tokens: max_tokens,
             messages: [user_message(prompt, image)]
           }
@@ -56,7 +71,8 @@ defmodule ZyzyvaLlm.Providers.Vision do
                receive_timeout: timeout
              ) do
           {:ok, %{status: 200, body: response_body}} ->
-            {:ok, extract_text(response_body)}
+            {:ok, extract_text(response_body),
+             %{model: model, usage: extract_usage(response_body)}}
 
           {:ok, %{status: status, body: response_body}} ->
             {:error, {:api_error, status, response_body}}
@@ -101,4 +117,6 @@ defmodule ZyzyvaLlm.Providers.Vision do
 
     text || ""
   end
+
+  defp extract_usage(response_body), do: Map.get(response_body, "usage")
 end
