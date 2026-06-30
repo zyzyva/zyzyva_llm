@@ -15,20 +15,34 @@ defmodule ZyzyvaLlm.Models do
 
   ## Roles
 
-    * `:text`   - general chat/synthesis/parsing. Default `openai/gpt-oss-120b`.
-    * `:fast`   - low-latency / cheaper work. Default `openai/gpt-oss-20b`.
-    * `:search` - Groq's web-search model. Default `groq/compound`.
+    * `:text`             - general chat/synthesis/parsing. Default `openai/gpt-oss-120b`.
+    * `:fast`             - low-latency / cheaper work. Default `openai/gpt-oss-20b`.
+    * `:search`           - Groq's web-search model. Default `groq/compound`.
+    * `:vision`           - primary vision model. Default `gemini-3.1-flash-lite`.
+    * `:vision_secondary` - secondary vision model. Default `gemini-2.5-flash-lite`.
+    * `:vision_fallback`  - cross-vendor vision fallback. Default `qwen/qwen3.6-27b` (Groq).
   """
 
   @default_text "openai/gpt-oss-120b"
   @default_fast "openai/gpt-oss-20b"
   @default_search "groq/compound"
+  @default_vision "gemini-3.1-flash-lite"
+  @default_vision_secondary "gemini-2.5-flash-lite"
+  @default_vision_fallback "qwen/qwen3.6-27b"
 
   @doc "Returns the model id for the given role."
-  @spec model(:text | :fast | :search) :: String.t()
+  @spec model(:text | :fast | :search | :vision | :vision_secondary | :vision_fallback) ::
+          String.t()
   def model(:text), do: resolve("ZYZYVA_LLM_TEXT_MODEL", :text, @default_text)
   def model(:fast), do: resolve("ZYZYVA_LLM_FAST_MODEL", :fast, @default_fast)
   def model(:search), do: resolve("ZYZYVA_LLM_SEARCH_MODEL", :search, @default_search)
+  def model(:vision), do: resolve("ZYZYVA_LLM_VISION_MODEL", :vision, @default_vision)
+
+  def model(:vision_secondary),
+    do: resolve("ZYZYVA_LLM_VISION_SECONDARY_MODEL", :vision_secondary, @default_vision_secondary)
+
+  def model(:vision_fallback),
+    do: resolve("ZYZYVA_LLM_VISION_FALLBACK_MODEL", :vision_fallback, @default_vision_fallback)
 
   defp resolve(env_var, role, default) do
     System.get_env(env_var) || configured(role) || default

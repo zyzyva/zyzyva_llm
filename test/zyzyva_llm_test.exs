@@ -25,4 +25,11 @@ defmodule ZyzyvaLlmTest do
   test "model/1 delegates to the registry" do
     assert is_binary(ZyzyvaLlm.model(:text))
   end
+
+  test "vision/4 routes to the named provider" do
+    image = %{data: "aGVsbG8=", mime_type: "image/png"}
+
+    assert {:ok, "routed"} =
+             ZyzyvaLlm.vision(:groq, "extract", image, api_key: "k", http_client: EchoStub)
+  end
 end

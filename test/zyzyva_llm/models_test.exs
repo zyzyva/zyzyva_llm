@@ -18,6 +18,27 @@ defmodule ZyzyvaLlm.ModelsTest do
     end
   end
 
+  describe "model/1 vision roles" do
+    test "vision role defaults to gemini-3.1-flash-lite" do
+      assert Models.model(:vision) == "gemini-3.1-flash-lite"
+    end
+
+    test "vision_secondary role defaults to gemini-2.5-flash-lite" do
+      assert Models.model(:vision_secondary) == "gemini-2.5-flash-lite"
+    end
+
+    test "vision_fallback role defaults to qwen/qwen3.6-27b" do
+      assert Models.model(:vision_fallback) == "qwen/qwen3.6-27b"
+    end
+
+    test "ZYZYVA_LLM_VISION_MODEL overrides the vision default" do
+      System.put_env("ZYZYVA_LLM_VISION_MODEL", "custom-vision-model")
+      on_exit(fn -> System.delete_env("ZYZYVA_LLM_VISION_MODEL") end)
+
+      assert Models.model(:vision) == "custom-vision-model"
+    end
+  end
+
   describe "model/1 overrides" do
     test "environment variable overrides the default" do
       System.put_env("ZYZYVA_LLM_TEXT_MODEL", "custom-text-model")
