@@ -14,6 +14,14 @@ defmodule ZyzyvaLlm.Providers.VisionTest do
     def post(_url, _opts), do: {:ok, %{status: 429, body: %{"error" => "rate limited"}}}
   end
 
+  defmodule BadRequestStub do
+    def post(_url, _opts), do: {:ok, %{status: 400, body: %{"error" => "bad request"}}}
+  end
+
+  defmodule EmptyBodyStub do
+    def post(_url, _opts), do: {:ok, %{status: 200, body: %{}}}
+  end
+
   defmodule TransportErrorStub do
     def post(_url, _opts), do: {:error, :timeout}
   end
@@ -37,6 +45,16 @@ defmodule ZyzyvaLlm.Providers.VisionTest do
     test "returns an api_error tuple on a non-200 response" do
       assert {:error, {:api_error, 429, _body}} =
                Vision.call(:groq, "read this", @image, api_key: "k", http_client: RateLimitStub)
+    end
+
+    test "surfaces the status so transient (429) and permanent (4xx) errors stay distinguishable" do
+      assert {:error, {:api_error, 400, _body}} =
+               Vision.call(:groq, "read this", @image, api_key: "k", http_client: BadRequestStub)
+    end
+
+    test "returns {:ok, \"\"} on a 200 with no choices rather than crashing" do
+      assert {:ok, ""} =
+               Vision.call(:groq, "read this", @image, api_key: "k", http_client: EmptyBodyStub)
     end
 
     test "returns request_failed on a transport error" do
