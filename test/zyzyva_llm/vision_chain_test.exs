@@ -222,6 +222,30 @@ defmodule ZyzyvaLlm.VisionChainTest do
 
       assert log =~ "leg crashed"
     end
+
+    test "a validator that throws (non-exception) is also contained and falls through" do
+      stages = [
+        [%{provider: :gemini, model: "ok-primary"}],
+        [%{provider: :groq, model: "ok-fallback"}]
+      ]
+
+      throwing_validator = fn
+        "PRIMARY" -> throw(:boom)
+        text -> {:ok, "parsed:" <> text}
+      end
+
+      log =
+        capture_log(fn ->
+          assert {:ok, "parsed:FALLBACK", %{stage: 2}} =
+                   ZyzyvaLlm.vision_chain(stages, "p", @image,
+                     api_key: "k",
+                     http_client: ChainStub,
+                     validator: throwing_validator
+                   )
+        end)
+
+      assert log =~ "leg crashed"
+    end
   end
 
   describe "validator contract" do
@@ -243,6 +267,28 @@ defmodule ZyzyvaLlm.VisionChainTest do
           validator: :not_a_function
         )
       end
+    end
+
+    test "a validator return that breaks the {:ok, parsed} | :error contract is treated as unusable" do
+      stages = [
+        [%{provider: :gemini, model: "ok-primary"}],
+        [%{provider: :groq, model: "ok-fallback"}]
+      ]
+
+      # Returns neither {:ok, parsed} nor :error for the stage-1 leg; the chain
+      # treats the non-conforming value as unusable and falls through rather than
+      # crashing or accepting it.
+      non_conforming_validator = fn
+        "PRIMARY" -> :nope
+        text -> {:ok, "parsed:" <> text}
+      end
+
+      assert {:ok, "parsed:FALLBACK", %{stage: 2}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image,
+                 api_key: "k",
+                 http_client: ChainStub,
+                 validator: non_conforming_validator
+               )
     end
   end
 
