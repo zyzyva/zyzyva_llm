@@ -144,7 +144,7 @@ defmodule ZyzyvaLlm.VisionChain do
     {model_id, fn -> run_leg(entry, model_id, prompt, image, opts) end}
   rescue
     exception ->
-      detail = inspect(exception.__struct__)
+      detail = exception_detail(exception)
       label = model_label(entry)
       log_leg_crash(entry, label, detail)
       {label, fn -> {:failed, {:crashed, detail}} end}
@@ -152,7 +152,7 @@ defmodule ZyzyvaLlm.VisionChain do
 
   defp model_label(entry), do: model_label_of(Map.get(entry, :model))
   defp model_label_of(model) when is_binary(model), do: model
-  defp model_label_of(model), do: inspect(model)
+  defp model_label_of(model), do: short_inspect(model)
 
   defp settle_leg({entry, model_id, task, timeout}) do
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
@@ -166,9 +166,9 @@ defmodule ZyzyvaLlm.VisionChain do
         {entry, model_id, {:failed, {:request_failed, :timeout}}}
 
       # The task died abnormally for a reason other than overrunning its timeout;
-      # record it as a crash rather than mislabeling it a timeout.
+      # record it as a crash (type-level only) rather than mislabeling it a timeout.
       {:exit, reason} ->
-        {entry, model_id, {:failed, {:crashed, "exit #{inspect(reason)}"}}}
+        {entry, model_id, {:failed, {:crashed, caught_detail(:exit, reason)}}}
     end
   end
 
@@ -199,20 +199,38 @@ defmodule ZyzyvaLlm.VisionChain do
     attempt_leg(entry, model_id, prompt, image, opts, Keyword.get(opts, :max_retries, 1))
   rescue
     exception ->
-      detail = inspect(exception.__struct__)
+      detail = exception_detail(exception)
       log_leg_crash(entry, model_id, detail)
       {:failed, {:crashed, detail}}
   catch
     kind, reason ->
-      detail = "#{kind} #{inspect(reason)}"
+      detail = caught_detail(kind, reason)
       log_leg_crash(entry, model_id, detail)
       {:failed, {:crashed, detail}}
   end
 
+  # The crash detail is a SHORT, TYPE-LEVEL descriptor only — never the raised
+  # message, the thrown value, the exit payload, or any provider/validator data
+  # (which can carry domain content / PII). A raise records its struct name; a
+  # throw records the kind only; an exit records the kind plus the wrapped
+  # exception's struct name when present.
+  defp exception_detail(exception), do: short_inspect(exception.__struct__)
+
+  defp caught_detail(:exit, reason), do: "exit" <> exit_suffix(reason)
+  defp caught_detail(kind, _reason), do: to_string(kind)
+
+  defp exit_suffix({reason, _stacktrace}) when is_exception(reason),
+    do: " " <> short_inspect(reason.__struct__)
+
+  defp exit_suffix(_reason), do: ""
+
+  @inspect_opts [printable_limit: 64, limit: 5]
+  defp short_inspect(term), do: inspect(term, @inspect_opts)
+
   defp log_leg_crash(entry, model_id, detail) do
     Logger.warning(
       "ZyzyvaLlm.vision_chain leg crashed " <>
-        "(#{inspect(entry.provider)}/#{inspect(model_id)}): #{detail}"
+        "(#{short_inspect(entry.provider)}/#{short_inspect(model_id)}): #{detail}"
     )
   end
 
@@ -254,8 +272,9 @@ defmodule ZyzyvaLlm.VisionChain do
     do: {:failed, :api_key_not_configured}
 
   # Defensive: an error shape outside Vision's closed return contract is contained
-  # and surfaced as a crash rather than raising. Not expected to fire today.
-  defp classify({:error, reason}, _validator), do: {:failed, {:crashed, inspect(reason)}}
+  # and surfaced as a crash rather than raising. Not expected to fire today; the
+  # detail is bounded so even an unforeseen reason cannot expand without bound.
+  defp classify({:error, reason}, _validator), do: {:failed, {:crashed, short_inspect(reason)}}
 
   defp validate({:ok, parsed}, info), do: {:accept, parsed, info}
   # A validator-rejected 200 is out of contention and NOT retried (the same
