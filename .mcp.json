@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bus": {
+      "type": "http",
+      "url": "http://192.168.1.101:8181/mcp",
+      "headers": {
+        "X-Architect": "zyzyva_llm"
+      }
+    }
+  }
+}
