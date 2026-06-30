@@ -10,23 +10,26 @@ defmodule ZyzyvaLlm.VisionChain do
   usable. The library owns *when to escalate and which result to accept*; the
   consuming app owns the prompt and the validator (it never parses domain data).
 
-  Failure handling mirrors slice 01's return values:
+  A usable result always wins and ends the chain — within a stage by hierarchy
+  (earliest preferred), across stages by the first stage that yields one. No
+  failure of any kind short-circuits the chain: a failed leg (any provider error,
+  including a 4xx) or a validator-rejected 200 is simply out of contention; a stage
+  with no usable result advances to the next, and a chain with no usable result
+  anywhere returns `{:error, :exhausted}`. The chain is cross-vendor with differing
+  provider limits, so a 4xx on one provider does not mean another will fail too —
+  the only way to know is to try the next leg/stage.
 
-    * Transient (try another leg/stage): `{:api_error, 429, _}`, any
-      `{:api_error, status, _}` with `status >= 500`, `{:request_failed, _}`, and
-      `:api_key_not_configured` (that one provider is unavailable). A
-      validator-rejected 200 also falls through like a transient failure.
-    * Client-side / permanent (short-circuit the whole chain, returned as-is):
-      `{:api_error, status, _}` with `status` in 400..499 except 429 — no provider
-      will do better, so the first such error ends the chain.
+  The transient-vs-permanent distinction governs ONLY the bounded in-leg retry
+  (`:max_retries`, default 1), never chain termination:
 
-  A bounded in-leg retry on a transient provider error is allowed (`:max_retries`,
-  default 1); the headline resilience is the cross-vendor stage, not deep
-  same-vendor retries.
+    * Transient — retried: `{:api_error, 429, _}`, any `{:api_error, status, _}`
+      with `status >= 500`, and `{:request_failed, _}` (transport/timeout).
+    * Permanent — not retried: a 4xx other than 429, `:api_key_not_configured`,
+      and a validator-rejected 200 (a retry returns the same result).
 
   A leg that raises (a validator that throws, a malformed provider body, a bad
   model id) is contained: the crash is logged and that leg falls through like a
-  transient failure rather than taking down the caller process.
+  failed leg rather than taking down the caller process.
   """
 
   alias ZyzyvaLlm.Providers.Vision
@@ -51,8 +54,9 @@ defmodule ZyzyvaLlm.VisionChain do
 
   @doc """
   Runs the staged-race chain. Returns `{:ok, parsed, metadata}` on the first
-  usable result, `{:error, :exhausted}` when no leg in any stage is usable, or the
-  underlying client-side error tuple as-is on a permanent short-circuit.
+  usable result (within a stage by hierarchy, across stages by the first stage
+  that yields one), or `{:error, :exhausted}` when no leg in any stage is usable.
+  No failure short-circuits the chain.
 
   `opts` requires `:validator` (`fun(String.t()) :: {:ok, parsed} | :error`) and
   passes `:api_key` / `:http_client` through to every leg. `:max_retries`
@@ -84,9 +88,6 @@ defmodule ZyzyvaLlm.VisionChain do
 
   defp advance(:exhausted, rest, stage_number, prompt, image, opts),
     do: run_stages(rest, stage_number + 1, prompt, image, opts)
-
-  defp advance({:error, _reason} = error, _rest, _stage_number, _prompt, _image, _opts),
-    do: error
 
   # Fire every leg first (so they run concurrently), then settle each within its
   # own timeout, then accept by hierarchy order.
@@ -121,10 +122,10 @@ defmodule ZyzyvaLlm.VisionChain do
       {entry, {:accept, parsed, info}}, _acc ->
         {:halt, {:ok, parsed, metadata(entry, info, stage_number)}}
 
-      {_entry, {:client_error, error}}, _acc ->
-        {:halt, error}
-
-      {_entry, :skip}, acc ->
+      # Any non-usable leg (a provider error or a validator-rejected 200) is out
+      # of contention; it never ends the chain. A stage that yields no usable
+      # result falls through to the next stage (handled by advance/6).
+      {_entry, _not_usable}, acc ->
         {:cont, acc}
     end)
   end
@@ -168,11 +169,18 @@ defmodule ZyzyvaLlm.VisionChain do
 
   defp classify({:ok, text, info}, validator), do: validate(validator.(text), info)
 
-  defp classify({:error, {:api_error, status, _body}} = error, _validator)
-       when status in 400..499 and status != 429,
-       do: {:client_error, error}
+  # Transient provider failures — eligible for the bounded in-leg retry.
+  defp classify({:error, {:api_error, 429, _body}}, _validator), do: :transient
 
-  defp classify({:error, _transient}, _validator), do: :transient
+  defp classify({:error, {:api_error, status, _body}}, _validator) when status >= 500,
+    do: :transient
+
+  defp classify({:error, {:request_failed, _reason}}, _validator), do: :transient
+
+  # Permanent failures — no retry; the leg is simply out of contention. Covers a
+  # 4xx other than 429 and a missing key (other providers may still work), plus
+  # any unexpected error shape (retrying an unknown failure would not help).
+  defp classify({:error, _permanent}, _validator), do: :skip
 
   defp validate({:ok, parsed}, info), do: {:accept, parsed, info}
   # A validator-rejected 200 falls through like a transient failure, but is NOT

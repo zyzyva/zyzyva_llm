@@ -96,18 +96,19 @@ Returns:
 
 - `{:ok, parsed, %{provider:, model:, stage:, usage:}}` — the validator's parsed
   value plus which provider/model won, the 1-based stage, and the winning
-  response's token `usage` (or `nil`).
-- `{:error, :exhausted}` — every leg in every stage failed transiently or was
-  judged unusable.
-- the underlying client error as-is (e.g. `{:error, {:api_error, 400, body}}`) when
-  a leg hits a permanent 4xx (except 429) — the chain short-circuits, since no
-  provider will do better.
+  response's token `usage` (or `nil`). A usable result always wins and ends the
+  chain.
+- `{:error, :exhausted}` — no leg in any stage produced a usable result.
 
-Transient failures (429, any 5xx, transport errors, a missing key on one provider)
-and validator-rejected 200s advance to the next leg/stage; a bounded in-leg retry
-(`:max_retries`, default 1) covers transient provider blips. Image downscaling is
-not handled here (a too-large image surfaces as the provider's own client error);
-it is deferred pending a dependency decision.
+No failure short-circuits the chain: a failed leg (any error, including a 4xx) or a
+validator-rejected 200 is simply out of contention, and a stage with no usable
+result advances to the next — so a stage-1 Gemini 4xx falls through to a stage-2
+Groq leg (cross-vendor limits differ). The transient-vs-permanent split governs
+only the bounded in-leg retry (`:max_retries`, default 1): 429, 5xx, and transport
+errors are retried; a 4xx other than 429, a missing key, and an unusable 200 are
+not. Image downscaling is not handled here (an oversized image surfaces as the
+provider's own error and falls through); it lands in slice 03 as a caller-supplied
+downscale callback.
 
 ## Providers
 

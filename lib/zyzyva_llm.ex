@@ -97,8 +97,9 @@ defmodule ZyzyvaLlm do
 
   Within a stage every entry fires concurrently, each bounded by its own
   `:timeout`; the highest-hierarchy entry whose text the `:validator` accepts
-  wins. The chain advances to the next stage only when a stage yields nothing
-  usable. See `ZyzyvaLlm.VisionChain` for the transient-vs-permanent failure rules.
+  wins and ends the chain. The chain advances to the next stage only when a stage
+  yields nothing usable. No failure short-circuits it — see `ZyzyvaLlm.VisionChain`
+  for how transient-vs-permanent governs only the bounded in-leg retry.
 
   ## Options
 
@@ -112,9 +113,8 @@ defmodule ZyzyvaLlm do
     * `{:ok, parsed, %{provider:, model:, stage:, usage:}}` - the accepted parsed
       value plus which provider/model won, the 1-based stage, and the winning
       response's token `usage` (or `nil`)
-    * `{:error, :exhausted}` - no leg in any stage produced a usable result
-    * the underlying client-side error tuple as-is (e.g.
-      `{:error, {:api_error, 400, body}}`) on a permanent short-circuit
+    * `{:error, :exhausted}` - no leg in any stage produced a usable result; no
+      failure (including a 4xx) short-circuits the chain
   """
   @spec vision_chain([[VisionChain.entry()]], String.t(), image(), keyword()) ::
           {:ok, term(), VisionChain.metadata()} | {:error, term()}
