@@ -9,6 +9,10 @@ defmodule ZyzyvaLlm.VisionChainTest do
 
   @usage %{"prompt_tokens" => 11, "completion_tokens" => 7, "total_tokens" => 18}
 
+  # A unique string standing in for domain content (OCR'd PII) that a misbehaving
+  # validator might raise/throw; it must never reach the crash detail or the log.
+  @marker "DOMAIN_MARKER_4f3a9b2c"
+
   # Stub that branches on the model id carried in the request body, so a single
   # shared http_client can drive every leg of a multi-provider stage.
   defmodule ChainStub do
@@ -404,6 +408,107 @@ defmodule ZyzyvaLlm.VisionChainTest do
         end)
 
       assert log =~ "leg crashed"
+    end
+  end
+
+  describe "crash detail is type-level (no domain content)" do
+    test "a validator that raises records only the exception type, never the message" do
+      stages = [[%{provider: :gemini, model: "ok-primary"}]]
+      raising = fn _text -> raise @marker <> " secret card text" end
+
+      {result, log} =
+        with_log(fn ->
+          ZyzyvaLlm.vision_chain(stages, "p", @image,
+            api_key: "k",
+            http_client: ChainStub,
+            validator: raising
+          )
+        end)
+
+      assert {:error, {:exhausted, [%{outcome: {:crashed, detail}}]}} = result
+      assert detail == "RuntimeError"
+      refute detail =~ @marker
+      refute log =~ @marker
+    end
+
+    test "a validator that throws records only the kind, never the thrown value" do
+      stages = [[%{provider: :gemini, model: "ok-primary"}]]
+      throwing = fn _text -> throw(@marker <> " thrown domain value") end
+
+      {result, log} =
+        with_log(fn ->
+          ZyzyvaLlm.vision_chain(stages, "p", @image,
+            api_key: "k",
+            http_client: ChainStub,
+            validator: throwing
+          )
+        end)
+
+      assert {:error, {:exhausted, [%{outcome: {:crashed, detail}}]}} = result
+      assert detail == "throw"
+      refute detail =~ @marker
+      refute log =~ @marker
+    end
+
+    test "a validator that exits records only the exit kind, never the exit payload" do
+      stages = [[%{provider: :gemini, model: "ok-primary"}]]
+      exiting = fn _text -> exit(@marker <> " exit payload") end
+
+      {result, log} =
+        with_log(fn ->
+          ZyzyvaLlm.vision_chain(stages, "p", @image,
+            api_key: "k",
+            http_client: ChainStub,
+            validator: exiting
+          )
+        end)
+
+      assert {:error, {:exhausted, [%{outcome: {:crashed, detail}}]}} = result
+      assert detail == "exit"
+      refute detail =~ @marker
+      refute log =~ @marker
+    end
+
+    test "a validator that exits with a wrapped exception records the exception type only" do
+      stages = [[%{provider: :gemini, model: "ok-primary"}]]
+      exiting = fn _text -> exit({%RuntimeError{message: @marker}, []}) end
+
+      {result, log} =
+        with_log(fn ->
+          ZyzyvaLlm.vision_chain(stages, "p", @image,
+            api_key: "k",
+            http_client: ChainStub,
+            validator: exiting
+          )
+        end)
+
+      assert {:error, {:exhausted, [%{outcome: {:crashed, detail}}]}} = result
+      assert detail == "exit RuntimeError"
+      refute detail =~ @marker
+      refute log =~ @marker
+    end
+
+    test "a contained crash still falls through to a usable sibling leg" do
+      stages = [
+        [%{provider: :gemini, model: "ok-primary"}, %{provider: :groq, model: "ok-fallback"}]
+      ]
+
+      raising = fn
+        "PRIMARY" -> raise @marker
+        text -> {:ok, "parsed:" <> text}
+      end
+
+      {result, log} =
+        with_log(fn ->
+          ZyzyvaLlm.vision_chain(stages, "p", @image,
+            api_key: "k",
+            http_client: ChainStub,
+            validator: raising
+          )
+        end)
+
+      assert {:ok, "parsed:FALLBACK", %{provider: :groq, stage: 1}} = result
+      refute log =~ @marker
     end
   end
 
