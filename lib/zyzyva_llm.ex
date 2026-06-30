@@ -113,11 +113,14 @@ defmodule ZyzyvaLlm do
     * `{:ok, parsed, %{provider:, model:, stage:, usage:}}` - the accepted parsed
       value plus which provider/model won, the 1-based stage, and the winning
       response's token `usage` (or `nil`)
-    * `{:error, :exhausted}` - no leg in any stage produced a usable result; no
-      failure (including a 4xx) short-circuits the chain
+    * `{:error, {:exhausted, leg_outcomes}}` - no leg in any stage produced a
+      usable result; `leg_outcomes` lists every attempted leg in attempt order,
+      each `%{stage:, provider:, model:, outcome:}`. No failure (including a 4xx)
+      short-circuits the chain. See `ZyzyvaLlm.VisionChain` for the `outcome` kinds
   """
   @spec vision_chain([[VisionChain.entry()]], String.t(), image(), keyword()) ::
-          {:ok, term(), VisionChain.metadata()} | {:error, term()}
+          {:ok, term(), VisionChain.metadata()}
+          | {:error, {:exhausted, [VisionChain.leg_outcome()]}}
   def vision_chain(stages, prompt, image, opts),
     do: VisionChain.run(stages, prompt, image, opts)
 

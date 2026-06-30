@@ -98,7 +98,15 @@ Returns:
   value plus which provider/model won, the 1-based stage, and the winning
   response's token `usage` (or `nil`). A usable result always wins and ends the
   chain.
-- `{:error, :exhausted}` — no leg in any stage produced a usable result.
+- `{:error, {:exhausted, leg_outcomes}}` — no leg in any stage produced a usable
+  result. `leg_outcomes` lists every attempted leg in attempt order (stage, then
+  hierarchy), each `%{stage:, provider:, model:, outcome:}` with the resolved
+  model id and the leg's final `outcome` after any bounded retry. The library
+  reports what each leg did; the consuming app maps it to copy/alerts. An
+  `outcome` is one of `{:api_error, status}` (e.g. `401`/`403` auth/billing, `429`,
+  a 5xx, another 4xx), `{:request_failed, reason}` (a timeout is
+  `{:request_failed, :timeout}`), `:api_key_not_configured`, `:unusable` (a
+  validator-rejected 200), or `{:crashed, detail}` (a contained leg crash).
 
 No failure short-circuits the chain: a failed leg (any error, including a 4xx) or a
 validator-rejected 200 is simply out of contention, and a stage with no usable

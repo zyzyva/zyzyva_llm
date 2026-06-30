@@ -83,6 +83,14 @@ defmodule ZyzyvaLlm.Providers.Vision do
     end
   end
 
+  @doc false
+  # Resolves an entry's `:model` (a role atom, an explicit id, or `nil` for the
+  # provider default) to a concrete model id, the same way `call_with_usage/4`
+  # does — so the chain can pass a pre-resolved id and report it consistently in
+  # both the success metadata and the per-leg exhaustion outcomes.
+  @spec resolve_model_id(atom() | String.t() | nil, :gemini | :groq) :: String.t()
+  def resolve_model_id(model, provider), do: resolve_model(model, provider)
+
   defp base_url(:gemini),
     do: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
