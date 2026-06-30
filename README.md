@@ -156,4 +156,5 @@ ZyzyvaLlm.chat(:groq, messages, api_key: "k", http_client: SuccessStub)
 Text chat completions (`chat/3`), single-call vision input (`vision/4`), and the
 staged-race vision failover chain (`vision_chain/4`). The library returns raw
 provider text and uniform errors; prompts and parsing stay in the consuming apps.
-Image downscaling for the chain is deferred pending a dependency decision.
+Image downscaling for the chain is deferred to slice 03 as a caller-supplied
+downscale callback (no image dependency).
