@@ -68,6 +68,17 @@ defmodule ZyzyvaLlm.VisionChainTest do
     end
   end
 
+  # Counts attempts (shared ETS table) and always returns a permanent 400.
+  defmodule CountingBadRequestStub do
+    def post(_url, _opts) do
+      :zyzyva_llm
+      |> Application.get_env(:retry_table)
+      |> :ets.update_counter(:count, 1)
+
+      {:ok, %{status: 400, body: %{"error" => "bad image"}}}
+    end
+  end
+
   # Fails transiently on the first attempt, then recovers on the retry.
   defmodule RecoverStub do
     def post(_url, _opts) do
@@ -98,11 +109,11 @@ defmodule ZyzyvaLlm.VisionChainTest do
   end
 
   describe "stage progression" do
-    test "stage 1 usable short-circuits and stage 2 never fires" do
+    test "stage 1 usable wins and stage 2 never fires" do
       stages = [
         [%{provider: :gemini, model: "ok-primary"}],
-        # a client error here would short-circuit if stage 2 ever ran
-        [%{provider: :groq, model: "400"}]
+        # a different usable result here would surface if stage 2 wrongly ran
+        [%{provider: :groq, model: "ok-fallback"}]
       ]
 
       assert {:ok, "parsed:PRIMARY", meta} = ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
@@ -153,16 +164,31 @@ defmodule ZyzyvaLlm.VisionChainTest do
     end
   end
 
-  describe "client-side short-circuit" do
-    test "a 4xx other than 429 short-circuits immediately and is returned as-is" do
+  describe "client 4xx does not short-circuit" do
+    test "a higher-hierarchy 4xx still lets a usable lower-hierarchy leg win in the same stage" do
+      stages = [
+        [%{provider: :gemini, model: "400"}, %{provider: :groq, model: "ok-fallback"}]
+      ]
+
+      assert {:ok, "parsed:FALLBACK", meta} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+
+      assert meta == %{provider: :groq, model: "ok-fallback", stage: 1, usage: @usage}
+    end
+
+    test "a stage-1 4xx with no usable leg advances to the next stage" do
       stages = [
         [%{provider: :gemini, model: "400"}],
-        # a usable result here would win if the chain did not short-circuit first
         [%{provider: :groq, model: "ok-fallback"}]
       ]
 
-      assert {:error, {:api_error, 400, %{"error" => "bad image"}}} =
+      assert {:ok, "parsed:FALLBACK", %{provider: :groq, stage: 2}} =
                ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a 4xx with no usable leg anywhere returns {:error, :exhausted}" do
+      stages = [[%{provider: :gemini, model: "400"}]]
+      assert {:error, :exhausted} = ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
     end
   end
 
@@ -313,6 +339,21 @@ defmodule ZyzyvaLlm.VisionChainTest do
                )
 
       # called exactly once: an unusable 200 falls through without an in-leg retry
+      assert [{:count, 1}] = :ets.lookup(table, :count)
+    end
+
+    test "a permanent 4xx is not retried in-leg", %{table: table} do
+      stages = [[%{provider: :groq, model: "x"}]]
+
+      assert {:error, :exhausted} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image,
+                 api_key: "k",
+                 http_client: CountingBadRequestStub,
+                 validator: validator(),
+                 max_retries: 3
+               )
+
+      # called exactly once: a permanent 4xx is out of contention, not retried
       assert [{:count, 1}] = :ets.lookup(table, :count)
     end
 
