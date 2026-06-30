@@ -23,6 +23,7 @@ defmodule ZyzyvaLlm.VisionChainTest do
     defp respond("429"), do: {:ok, %{status: 429, body: %{"error" => "rate limited"}}}
     defp respond("500"), do: {:ok, %{status: 500, body: %{"error" => "overloaded"}}}
     defp respond("400"), do: {:ok, %{status: 400, body: %{"error" => "bad image"}}}
+    defp respond("403"), do: {:ok, %{status: 403, body: %{"error" => "billing inactive"}}}
     defp respond("transport"), do: {:error, :econnrefused}
     # a 200 with a non-map body makes the leg's response extraction raise
     defp respond("crash"), do: {:ok, %{status: 200, body: "<html>not json</html>"}}
@@ -144,13 +145,14 @@ defmodule ZyzyvaLlm.VisionChainTest do
       assert meta == %{provider: :groq, model: "ok-fallback", stage: 2, usage: @usage}
     end
 
-    test "every leg failing transiently returns {:error, :exhausted}" do
+    test "every leg failing transiently returns {:error, {:exhausted, _}}" do
       stages = [
         [%{provider: :gemini, model: "429"}],
         [%{provider: :gemini, model: "500"}, %{provider: :groq, model: "transport"}]
       ]
 
-      assert {:error, :exhausted} = ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+      assert {:error, {:exhausted, _outcomes}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
     end
 
     test "an unusable 200 falls through exactly like a transient failure" do
@@ -186,9 +188,140 @@ defmodule ZyzyvaLlm.VisionChainTest do
                ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
     end
 
-    test "a 4xx with no usable leg anywhere returns {:error, :exhausted}" do
+    test "a 4xx with no usable leg anywhere returns {:error, {:exhausted, _}}" do
       stages = [[%{provider: :gemini, model: "400"}]]
-      assert {:error, :exhausted} = ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+
+      assert {:error, {:exhausted, [%{outcome: {:api_error, 400}}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+  end
+
+  describe "exhaustion leg outcomes" do
+    test "a 403 is recorded as {:api_error, 403}" do
+      stages = [[%{provider: :gemini, model: "403"}]]
+
+      assert {:error, {:exhausted, [%{outcome: {:api_error, 403}}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a transient code retried to exhaustion records the final attempt's status" do
+      stages = [[%{provider: :gemini, model: "429"}]]
+
+      assert {:error, {:exhausted, [%{outcome: {:api_error, 429}}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a transport failure is recorded as {:request_failed, _}" do
+      stages = [[%{provider: :gemini, model: "transport"}]]
+
+      assert {:error, {:exhausted, [%{outcome: {:request_failed, :econnrefused}}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a leg that exceeds its timeout is recorded as {:request_failed, :timeout}" do
+      stages = [[%{provider: :gemini, model: "hang", timeout: 20}]]
+
+      assert {:error, {:exhausted, [%{outcome: {:request_failed, :timeout}}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a missing key is recorded as :api_key_not_configured" do
+      original = System.get_env("GROQ_API_KEY")
+      System.delete_env("GROQ_API_KEY")
+      on_exit(fn -> if original, do: System.put_env("GROQ_API_KEY", original) end)
+
+      stages = [[%{provider: :groq, model: "ok-fallback"}]]
+
+      # no :api_key passed and GROQ_API_KEY cleared -> the leg resolves no key
+      assert {:error, {:exhausted, [%{provider: :groq, outcome: :api_key_not_configured}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image,
+                 http_client: ChainStub,
+                 validator: validator()
+               )
+    end
+
+    test "a validator-rejected 200 is recorded as :unusable" do
+      stages = [[%{provider: :gemini, model: "unusable"}]]
+
+      assert {:error, {:exhausted, [%{outcome: :unusable}]}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+    end
+
+    test "a contained leg crash is recorded as {:crashed, _}" do
+      stages = [[%{provider: :gemini, model: "crash"}]]
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:exhausted, [%{outcome: {:crashed, _}}]}} =
+                   ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+        end)
+
+      assert log =~ "leg crashed"
+    end
+
+    test "an unregistered model role is contained, not raised at the caller" do
+      stages = [[%{provider: :gemini, model: :unregistered_role}]]
+
+      log =
+        capture_log(fn ->
+          assert {:error,
+                  {:exhausted,
+                   [%{provider: :gemini, model: ":unregistered_role", outcome: {:crashed, _}}]}} =
+                   ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+        end)
+
+      assert log =~ "leg crashed"
+    end
+
+    test "lists every attempted leg across stages in attempt order with stage/provider/model" do
+      stages = [
+        [%{provider: :gemini, model: "403"}],
+        [%{provider: :gemini, model: "unusable"}, %{provider: :groq, model: "transport"}]
+      ]
+
+      assert {:error, {:exhausted, outcomes}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+
+      assert outcomes == [
+               %{stage: 1, provider: :gemini, model: "403", outcome: {:api_error, 403}},
+               %{stage: 2, provider: :gemini, model: "unusable", outcome: :unusable},
+               %{
+                 stage: 2,
+                 provider: :groq,
+                 model: "transport",
+                 outcome: {:request_failed, :econnrefused}
+               }
+             ]
+    end
+
+    test "an auth/billing 403 is detectable from the outcomes alone" do
+      stages = [
+        [%{provider: :gemini, model: "403"}],
+        [%{provider: :groq, model: "500"}]
+      ]
+
+      assert {:error, {:exhausted, outcomes}} =
+               ZyzyvaLlm.vision_chain(stages, "p", @image, opts())
+
+      assert Enum.any?(outcomes, fn o -> o.outcome in [{:api_error, 401}, {:api_error, 403}] end)
+    end
+
+    test "an all-unusable exhaustion is distinguishable from an all-errored one" do
+      unusable = [
+        [%{provider: :gemini, model: "unusable"}, %{provider: :groq, model: "unusable"}]
+      ]
+
+      assert {:error, {:exhausted, unusable_outcomes}} =
+               ZyzyvaLlm.vision_chain(unusable, "p", @image, opts())
+
+      assert Enum.all?(unusable_outcomes, fn o -> o.outcome == :unusable end)
+
+      errored = [[%{provider: :gemini, model: "500"}, %{provider: :groq, model: "transport"}]]
+
+      assert {:error, {:exhausted, errored_outcomes}} =
+               ZyzyvaLlm.vision_chain(errored, "p", @image, opts())
+
+      refute Enum.all?(errored_outcomes, fn o -> o.outcome == :unusable end)
     end
   end
 
@@ -330,7 +463,7 @@ defmodule ZyzyvaLlm.VisionChainTest do
     test "an unusable 200 is not retried in-leg", %{table: table} do
       stages = [[%{provider: :groq, model: "x"}]]
 
-      assert {:error, :exhausted} =
+      assert {:error, {:exhausted, _outcomes}} =
                ZyzyvaLlm.vision_chain(stages, "p", @image,
                  api_key: "k",
                  http_client: CountingUnusableStub,
@@ -345,7 +478,7 @@ defmodule ZyzyvaLlm.VisionChainTest do
     test "a permanent 4xx is not retried in-leg", %{table: table} do
       stages = [[%{provider: :groq, model: "x"}]]
 
-      assert {:error, :exhausted} =
+      assert {:error, {:exhausted, _outcomes}} =
                ZyzyvaLlm.vision_chain(stages, "p", @image,
                  api_key: "k",
                  http_client: CountingBadRequestStub,
@@ -360,7 +493,7 @@ defmodule ZyzyvaLlm.VisionChainTest do
     test "retries a transient error and stops at :max_retries", %{table: table} do
       stages = [[%{provider: :groq, model: "429"}]]
 
-      assert {:error, :exhausted} =
+      assert {:error, {:exhausted, _outcomes}} =
                ZyzyvaLlm.vision_chain(stages, "p", @image,
                  api_key: "k",
                  http_client: CountingStub,
@@ -387,7 +520,7 @@ defmodule ZyzyvaLlm.VisionChainTest do
     test "defaults to a single retry when :max_retries is not given", %{table: table} do
       stages = [[%{provider: :groq, model: "429"}]]
 
-      assert {:error, :exhausted} =
+      assert {:error, {:exhausted, _outcomes}} =
                ZyzyvaLlm.vision_chain(stages, "p", @image,
                  api_key: "k",
                  http_client: CountingStub,

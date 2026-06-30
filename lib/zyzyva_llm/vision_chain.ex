@@ -15,9 +15,25 @@ defmodule ZyzyvaLlm.VisionChain do
   failure of any kind short-circuits the chain: a failed leg (any provider error,
   including a 4xx) or a validator-rejected 200 is simply out of contention; a stage
   with no usable result advances to the next, and a chain with no usable result
-  anywhere returns `{:error, :exhausted}`. The chain is cross-vendor with differing
-  provider limits, so a 4xx on one provider does not mean another will fail too —
-  the only way to know is to try the next leg/stage.
+  anywhere returns `{:error, {:exhausted, leg_outcomes}}`. The chain is cross-vendor
+  with differing provider limits, so a 4xx on one provider does not mean another
+  will fail too — the only way to know is to try the next leg/stage.
+
+  On exhaustion, `leg_outcomes` lists every attempted leg in attempt order (stage,
+  then hierarchy within the stage), each a `%{stage:, provider:, model:, outcome:}`
+  with the resolved model id and the leg's final `outcome` after any bounded retry.
+  The library reports what each leg did (raw status/reason); the consuming app maps
+  that to its own copy/alerts. An `outcome` is one of:
+
+    * `{:api_error, status}` — a non-200 HTTP response (e.g. 401/403 auth/billing,
+      429, a 5xx, another 4xx). For a transient code retried to exhaustion this is
+      the final attempt's status.
+    * `{:request_failed, reason}` — a transport error; a leg that exceeds its
+      `:timeout` records as `{:request_failed, :timeout}`.
+    * `:api_key_not_configured` — no API key resolved for that provider.
+    * `:unusable` — an HTTP 200 the validator rejected.
+    * `{:crashed, detail}` — the leg raised/exited and was contained (`detail` a
+      short descriptor), kept distinct from a request failure.
 
   The transient-vs-permanent distinction governs ONLY the bounded in-leg retry
   (`:max_retries`, default 1), never chain termination:
@@ -28,8 +44,8 @@ defmodule ZyzyvaLlm.VisionChain do
       and a validator-rejected 200 (a retry returns the same result).
 
   A leg that raises (a validator that throws, a malformed provider body, a bad
-  model id) is contained: the crash is logged and that leg falls through like a
-  failed leg rather than taking down the caller process.
+  model id) is contained: the crash is logged, recorded as `{:crashed, detail}`,
+  and that leg falls through like a failed leg rather than taking down the caller.
   """
 
   alias ZyzyvaLlm.Providers.Vision
@@ -49,24 +65,38 @@ defmodule ZyzyvaLlm.VisionChain do
           stage: pos_integer(),
           usage: map() | nil
         }
+  @type outcome ::
+          {:api_error, non_neg_integer()}
+          | {:request_failed, term()}
+          | :api_key_not_configured
+          | :unusable
+          | {:crashed, String.t()}
+  @type leg_outcome :: %{
+          stage: pos_integer(),
+          provider: :gemini | :groq,
+          model: String.t(),
+          outcome: outcome()
+        }
 
   @default_timeout 120_000
 
   @doc """
   Runs the staged-race chain. Returns `{:ok, parsed, metadata}` on the first
   usable result (within a stage by hierarchy, across stages by the first stage
-  that yields one), or `{:error, :exhausted}` when no leg in any stage is usable.
-  No failure short-circuits the chain.
+  that yields one), or `{:error, {:exhausted, leg_outcomes}}` when no leg in any
+  stage is usable — `leg_outcomes` is every attempted leg in attempt order, each
+  carrying its `stage`, `provider`, resolved `model`, and final `outcome`. No
+  failure short-circuits the chain.
 
   `opts` requires `:validator` (`fun(String.t()) :: {:ok, parsed} | :error`) and
   passes `:api_key` / `:http_client` through to every leg. `:max_retries`
   (default 1) bounds the in-leg transient retry.
   """
   @spec run([[entry()]], String.t(), Vision.image(), keyword()) ::
-          {:ok, term(), metadata()} | {:error, term()}
+          {:ok, term(), metadata()} | {:error, {:exhausted, [leg_outcome()]}}
   def run(stages, prompt, image, opts) do
     opts |> Keyword.fetch!(:validator) |> ensure_validator!()
-    run_stages(stages, 1, prompt, image, opts)
+    run_stages(stages, 1, prompt, image, opts, [])
   end
 
   defp ensure_validator!(validator) when is_function(validator, 1), do: :ok
@@ -75,22 +105,23 @@ defmodule ZyzyvaLlm.VisionChain do
     do:
       raise(ArgumentError, "ZyzyvaLlm.vision_chain requires :validator to be a 1-arity function")
 
-  defp run_stages([], _stage_number, _prompt, _image, _opts), do: {:error, :exhausted}
+  defp run_stages([], _stage_number, _prompt, _image, _opts, acc),
+    do: {:error, {:exhausted, acc}}
 
-  defp run_stages([stage | rest], stage_number, prompt, image, opts) do
+  defp run_stages([stage | rest], stage_number, prompt, image, opts, acc) do
     stage
     |> run_stage(stage_number, prompt, image, opts)
-    |> advance(rest, stage_number, prompt, image, opts)
+    |> advance(rest, stage_number, prompt, image, opts, acc)
   end
 
-  defp advance({:ok, parsed, metadata}, _rest, _stage_number, _prompt, _image, _opts),
+  defp advance({:ok, parsed, metadata}, _rest, _stage_number, _prompt, _image, _opts, _acc),
     do: {:ok, parsed, metadata}
 
-  defp advance(:exhausted, rest, stage_number, prompt, image, opts),
-    do: run_stages(rest, stage_number + 1, prompt, image, opts)
+  defp advance({:exhausted, stage_outcomes}, rest, stage_number, prompt, image, opts, acc),
+    do: run_stages(rest, stage_number + 1, prompt, image, opts, acc ++ stage_outcomes)
 
   # Fire every leg first (so they run concurrently), then settle each within its
-  # own timeout, then accept by hierarchy order.
+  # own timeout, then accept by hierarchy order / collect the failed legs.
   defp run_stage(entries, stage_number, prompt, image, opts) do
     entries
     |> Enum.map(&spawn_leg(&1, prompt, image, opts))
@@ -99,102 +130,146 @@ defmodule ZyzyvaLlm.VisionChain do
   end
 
   defp spawn_leg(entry, prompt, image, opts) do
+    {model_id, leg_fun} = prepare_leg(entry, prompt, image, opts)
     timeout = Map.get(entry, :timeout, @default_timeout)
-    task = Task.async(fn -> run_leg(entry, prompt, image, opts) end)
-    {entry, task, timeout}
+    {entry, model_id, Task.async(leg_fun), timeout}
   end
 
-  defp settle_leg({entry, task, timeout}) do
+  # Resolve the model id up front so it labels the leg outcome, but contain a
+  # resolution failure (e.g. an unregistered role atom) here in the parent process
+  # rather than letting it crash the whole chain — the leg becomes a contained
+  # crash carrying a best-effort model label.
+  defp prepare_leg(entry, prompt, image, opts) do
+    model_id = Vision.resolve_model_id(Map.get(entry, :model), entry.provider)
+    {model_id, fn -> run_leg(entry, model_id, prompt, image, opts) end}
+  rescue
+    exception ->
+      detail = inspect(exception.__struct__)
+      label = model_label(entry)
+      log_leg_crash(entry, label, detail)
+      {label, fn -> {:failed, {:crashed, detail}} end}
+  end
+
+  defp model_label(entry), do: model_label_of(Map.get(entry, :model))
+  defp model_label_of(model) when is_binary(model), do: model
+  defp model_label_of(model), do: inspect(model)
+
+  defp settle_leg({entry, model_id, task, timeout}) do
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, outcome} ->
-        {entry, outcome}
+      {:ok, leg_result} ->
+        {entry, model_id, leg_result}
 
       # nil: the leg overran its timeout (hung) and was brutal-killed above, so
-      # treat it as a transient skip. Leg-internal crashes are contained in
-      # run_leg/4 and already come back through the {:ok, outcome} arm as :skip.
-      _timed_out ->
-        {entry, :skip}
+      # record it as a transport timeout. (Leg-internal crashes are contained in
+      # run_leg/5 and already arrive through the {:ok, leg_result} arm.)
+      nil ->
+        {entry, model_id, {:failed, {:request_failed, :timeout}}}
+
+      # The task died abnormally for a reason other than overrunning its timeout;
+      # record it as a crash rather than mislabeling it a timeout.
+      {:exit, reason} ->
+        {entry, model_id, {:failed, {:crashed, "exit #{inspect(reason)}"}}}
     end
   end
 
   defp decide(results, stage_number) do
-    Enum.reduce_while(results, :exhausted, fn
-      {entry, {:accept, parsed, info}}, _acc ->
+    results
+    |> Enum.reduce_while([], fn
+      {entry, _model_id, {:accept, parsed, info}}, _acc ->
         {:halt, {:ok, parsed, metadata(entry, info, stage_number)}}
 
-      # Any non-usable leg (a provider error or a validator-rejected 200) is out
-      # of contention; it never ends the chain. A stage that yields no usable
-      # result falls through to the next stage (handled by advance/6).
-      {_entry, _not_usable}, acc ->
-        {:cont, acc}
+      {entry, model_id, {:failed, outcome}}, acc ->
+        {:cont, [leg_outcome(entry, model_id, outcome, stage_number) | acc]}
     end)
+    |> finalize_stage()
+  end
+
+  defp finalize_stage({:ok, parsed, metadata}), do: {:ok, parsed, metadata}
+  defp finalize_stage(outcomes) when is_list(outcomes), do: {:exhausted, Enum.reverse(outcomes)}
+
+  defp leg_outcome(entry, model_id, outcome, stage_number) do
+    %{stage: stage_number, provider: entry.provider, model: model_id, outcome: outcome}
   end
 
   defp metadata(entry, %{model: model, usage: usage}, stage_number) do
     %{provider: entry.provider, model: model, stage: stage_number, usage: usage}
   end
 
-  defp run_leg(entry, prompt, image, opts) do
-    attempt_leg(entry, prompt, image, opts, Keyword.get(opts, :max_retries, 1))
+  defp run_leg(entry, model_id, prompt, image, opts) do
+    attempt_leg(entry, model_id, prompt, image, opts, Keyword.get(opts, :max_retries, 1))
   rescue
     exception ->
-      log_leg_crash(entry, inspect(exception.__struct__))
-      :skip
+      detail = inspect(exception.__struct__)
+      log_leg_crash(entry, model_id, detail)
+      {:failed, {:crashed, detail}}
   catch
     kind, reason ->
-      log_leg_crash(entry, "#{kind} #{inspect(reason)}")
-      :skip
+      detail = "#{kind} #{inspect(reason)}"
+      log_leg_crash(entry, model_id, detail)
+      {:failed, {:crashed, detail}}
   end
 
-  defp log_leg_crash(entry, detail) do
+  defp log_leg_crash(entry, model_id, detail) do
     Logger.warning(
       "ZyzyvaLlm.vision_chain leg crashed " <>
-        "(#{inspect(entry.provider)}/#{inspect(Map.get(entry, :model))}): #{detail}"
+        "(#{inspect(entry.provider)}/#{inspect(model_id)}): #{detail}"
     )
   end
 
-  defp attempt_leg(entry, prompt, image, opts, retries_left) do
+  defp attempt_leg(entry, model_id, prompt, image, opts, retries_left) do
     entry
-    |> call_vision(prompt, image, opts)
+    |> call_vision(model_id, prompt, image, opts)
     |> classify(opts[:validator])
-    |> resolve_attempt(entry, prompt, image, opts, retries_left)
+    |> resolve_attempt(entry, model_id, prompt, image, opts, retries_left)
   end
 
-  defp resolve_attempt(:transient, entry, prompt, image, opts, retries_left)
+  defp resolve_attempt({:retry, _outcome}, entry, model_id, prompt, image, opts, retries_left)
        when retries_left > 0,
-       do: attempt_leg(entry, prompt, image, opts, retries_left - 1)
+       do: attempt_leg(entry, model_id, prompt, image, opts, retries_left - 1)
 
-  defp resolve_attempt(:transient, _entry, _prompt, _image, _opts, _retries_left), do: :skip
-  defp resolve_attempt(outcome, _entry, _prompt, _image, _opts, _retries_left), do: outcome
+  # Retries exhausted: record the final attempt's outcome as the failure.
+  defp resolve_attempt({:retry, outcome}, _entry, _model_id, _prompt, _image, _opts, _retries),
+    do: {:failed, outcome}
+
+  defp resolve_attempt(result, _entry, _model_id, _prompt, _image, _opts, _retries), do: result
 
   defp classify({:ok, text, info}, validator), do: validate(validator.(text), info)
 
-  # Transient provider failures — eligible for the bounded in-leg retry.
-  defp classify({:error, {:api_error, 429, _body}}, _validator), do: :transient
+  # Transient provider failures — eligible for the bounded in-leg retry; the
+  # carried outcome is what gets recorded if the retries are exhausted.
+  defp classify({:error, {:api_error, 429, _body}}, _validator), do: {:retry, {:api_error, 429}}
 
   defp classify({:error, {:api_error, status, _body}}, _validator) when status >= 500,
-    do: :transient
+    do: {:retry, {:api_error, status}}
 
-  defp classify({:error, {:request_failed, _reason}}, _validator), do: :transient
+  defp classify({:error, {:request_failed, reason}}, _validator),
+    do: {:retry, {:request_failed, reason}}
 
-  # Permanent failures — no retry; the leg is simply out of contention. Covers a
-  # 4xx other than 429 and a missing key (other providers may still work), plus
-  # any unexpected error shape (retrying an unknown failure would not help).
-  defp classify({:error, _permanent}, _validator), do: :skip
+  # Permanent failures — no retry; out of contention but recorded. A 4xx other
+  # than 429 (including 401/403 auth/billing) keeps its status code.
+  defp classify({:error, {:api_error, status, _body}}, _validator),
+    do: {:failed, {:api_error, status}}
+
+  defp classify({:error, :api_key_not_configured}, _validator),
+    do: {:failed, :api_key_not_configured}
+
+  # Defensive: an error shape outside Vision's closed return contract is contained
+  # and surfaced as a crash rather than raising. Not expected to fire today.
+  defp classify({:error, reason}, _validator), do: {:failed, {:crashed, inspect(reason)}}
 
   defp validate({:ok, parsed}, info), do: {:accept, parsed, info}
-  # A validator-rejected 200 falls through like a transient failure, but is NOT
-  # retried in-leg (the same provider would return the same unusable result).
-  defp validate(:error, _info), do: :skip
-  # A non-conforming validator return is treated as unusable rather than crashing.
-  defp validate(_other, _info), do: :skip
+  # A validator-rejected 200 is out of contention and NOT retried (the same
+  # provider returns the same unusable result). A non-conforming validator return
+  # is treated the same way rather than crashing.
+  defp validate(:error, _info), do: {:failed, :unusable}
+  defp validate(_other, _info), do: {:failed, :unusable}
 
-  defp call_vision(entry, prompt, image, opts) do
+  defp call_vision(entry, model_id, prompt, image, opts) do
     leg_opts =
       [
         http_client: opts[:http_client],
         api_key: opts[:api_key],
-        model: Map.get(entry, :model),
+        model: model_id,
         max_tokens: Map.get(entry, :max_tokens),
         reasoning_effort: Map.get(entry, :reasoning_effort),
         timeout: Map.get(entry, :timeout)
