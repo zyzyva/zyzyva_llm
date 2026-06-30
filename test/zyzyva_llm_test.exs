@@ -32,4 +32,16 @@ defmodule ZyzyvaLlmTest do
     assert {:ok, "routed"} =
              ZyzyvaLlm.vision(:groq, "extract", image, api_key: "k", http_client: EchoStub)
   end
+
+  test "vision_chain/4 runs a stage and returns the accepted value with metadata" do
+    image = %{data: "aGVsbG8=", mime_type: "image/png"}
+    stages = [[%{provider: :groq, model: "m"}]]
+
+    assert {:ok, "routed", %{provider: :groq, model: "m", stage: 1}} =
+             ZyzyvaLlm.vision_chain(stages, "extract", image,
+               api_key: "k",
+               http_client: EchoStub,
+               validator: fn text -> {:ok, text} end
+             )
+  end
 end

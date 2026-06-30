@@ -27,6 +27,7 @@ defmodule ZyzyvaLlm do
   """
 
   alias ZyzyvaLlm.Providers.{Anthropic, Gemini, Grok, Groq, OpenAI, Perplexity, Vision}
+  alias ZyzyvaLlm.VisionChain
 
   @type provider :: :anthropic | :gemini | :grok | :groq | :openai | :perplexity
   @type role :: :text | :fast | :search | :vision | :vision_secondary | :vision_fallback
@@ -85,6 +86,40 @@ defmodule ZyzyvaLlm do
   def vision(provider, prompt, image, opts \\ [])
   def vision(:gemini, prompt, image, opts), do: Vision.call(:gemini, prompt, image, opts)
   def vision(:groq, prompt, image, opts), do: Vision.call(:groq, prompt, image, opts)
+
+  @doc """
+  Runs a staged-race vision failover chain over `vision/4`.
+
+  `stages` is an ordered list of stages; each stage is a list of entry maps whose
+  order is the acceptance hierarchy (earliest preferred). An entry names a
+  `:provider` (`:gemini` or `:groq`) and `:model` (a registry role atom or an
+  explicit id), with optional `:max_tokens`, `:reasoning_effort`, and `:timeout`.
+
+  Within a stage every entry fires concurrently, each bounded by its own
+  `:timeout`; the highest-hierarchy entry whose text the `:validator` accepts
+  wins. The chain advances to the next stage only when a stage yields nothing
+  usable. See `ZyzyvaLlm.VisionChain` for the transient-vs-permanent failure rules.
+
+  ## Options
+
+    * `:validator` (required) - `fun(String.t()) :: {:ok, parsed} | :error`; the
+      app decides whether a leg's raw text is usable and what the parsed value is
+    * `:api_key` / `:http_client` - passed through to every leg
+    * `:max_retries` - bounded in-leg transient retry (default 1)
+
+  ## Returns
+
+    * `{:ok, parsed, %{provider:, model:, stage:, usage:}}` - the accepted parsed
+      value plus which provider/model won, the 1-based stage, and the winning
+      response's token `usage` (or `nil`)
+    * `{:error, :exhausted}` - no leg in any stage produced a usable result
+    * the underlying client-side error tuple as-is (e.g.
+      `{:error, {:api_error, 400, body}}`) on a permanent short-circuit
+  """
+  @spec vision_chain([[VisionChain.entry()]], String.t(), image(), keyword()) ::
+          {:ok, term(), VisionChain.metadata()} | {:error, term()}
+  def vision_chain(stages, prompt, image, opts),
+    do: VisionChain.run(stages, prompt, image, opts)
 
   @doc """
   Sends a chat request using the configured default provider.
